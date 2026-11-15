@@ -4,11 +4,13 @@
 #include <stdint.h>
 struct PreprocessedInfo;
 struct Output;
+struct DedupTable;
 
 void handle_icmp(struct Output *out, time_t timestamp,
         const unsigned char *px, unsigned length,
         struct PreprocessedInfo *parsed,
-        uint64_t entropy);
+        uint64_t entropy,
+        struct DedupTable *dedup);
 
 int icmp_selftest(void);
 

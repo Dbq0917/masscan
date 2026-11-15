@@ -715,6 +715,7 @@ rawsock_init_adapter(const char *adapter_name,
 
         adapter->pcap = PCAP.open_offline(adapter_name+5, errbuf);
         adapter->link_type = PCAP.datalink(adapter->pcap);
+        return adapter;
     }
     /*----------------------------------------------------------------
      * PORTABILITY: LIBPCAP

@@ -32,7 +32,7 @@
  * This is the number of entries in our table. More entries does a better job at the
  * cost of using more memory.
  */
-#define DEDUP_ENTRIES 65536
+#define DEDUP_ENTRIES DEDUP_MIN_ENTRIES
 
 struct DedupEntry_IPv4
 {
@@ -46,18 +46,20 @@ struct DedupEntry_IPv6
 {
     ipv6address ip_them;
     ipv6address ip_me;
-    unsigned short port_them;
-    unsigned short port_me;
+    unsigned port_them;
+    unsigned port_me;
 };
 
 /**
  * This is simply the array of entries. We have two arrays, one for IPv4
- * and another for IPv6.
+ * and another for IPv6. The IPv6 array is allocated lazily upon the
+ * first IPv6 response, so that IPv4-only scans don't pay for it.
  */
 struct DedupTable
 {
-    struct DedupEntry_IPv4 entries[DEDUP_ENTRIES][4];
-    struct DedupEntry_IPv6 entries6[DEDUP_ENTRIES][4];
+    unsigned mask; /* bucket_count - 1, where bucket_count is a power-of-2 */
+    struct DedupEntry_IPv4 (*entries)[4];
+    struct DedupEntry_IPv6 (*entries6)[4];
 };
 
 /**
@@ -101,13 +103,28 @@ static inline unsigned fnv1a_longlong(unsigned long long data, unsigned hash)
 /**
  * Create a new table, which means simply allocating the object
  * and setting it to zero.
+ * @param bucket_count
+ *      The number of buckets desired, each holding 4 entries. This is
+ *      rounded up to a power-of-two, and clamped to a sane minimum.
+ *      Pass 0 to get the historic default size.
  */
 struct DedupTable *
-dedup_create(void)
+dedup_create(unsigned bucket_count)
 {
     struct DedupTable *dedup;
+    unsigned count = DEDUP_ENTRIES;
+
+    /* Round the requested size up to a power-of-two */
+    if (bucket_count > count) {
+        count = 1;
+        while (count < bucket_count && count < (1U<<31))
+            count <<= 1;
+    }
 
     dedup = CALLOC(1, sizeof(*dedup));
+    dedup->mask = count - 1;
+    dedup->entries = CALLOC(count, sizeof(*dedup->entries));
+    dedup->entries6 = NULL;
 
     return dedup;
 }
@@ -119,6 +136,8 @@ dedup_create(void)
 void
 dedup_destroy(struct DedupTable *dedup)
 {
+    free(dedup->entries);
+    free(dedup->entries6);
     free(dedup);
 }
 
@@ -190,10 +209,16 @@ dedup_is_duplicate_ipv6(struct DedupTable *dedup,
     struct DedupEntry_IPv6 *bucket;
     unsigned i;
 
+    /* The IPv6 table is allocated lazily, so that IPv4-only scans
+     * don't waste the memory */
+    if (dedup->entries6 == NULL) {
+        dedup->entries6 = CALLOC(dedup->mask + 1, sizeof(*dedup->entries6));
+    }
+
     /* THREAT: probably need to secure this hash, though the syn-cookies
      * provides some protection */
     hash = dedup_hash_ipv6(ip_them, port_them, ip_me, port_me);
-    hash &= DEDUP_ENTRIES-1;
+    hash &= dedup->mask;
 
     /* Search in this bucket */
     bucket = dedup->entries6[hash];
@@ -218,13 +243,29 @@ dedup_is_duplicate_ipv6(struct DedupTable *dedup,
     memmove(bucket, bucket+1, 3*sizeof(*bucket));
     bucket[0].ip_them.hi = ip_them.ipv6.hi;
     bucket[0].ip_them.lo = ip_them.ipv6.lo;
-    bucket[0].port_them = (unsigned short)port_them;
+    bucket[0].port_them = port_them;
     bucket[0].ip_me.hi = ip_me.ipv6.hi;
     bucket[0].ip_me.lo = ip_me.ipv6.lo;
-    bucket[0].port_me = (unsigned short)port_me;
+    bucket[0].port_me = port_me;
 
     return 0;
 
+}
+
+/***************************************************************************
+ * Create a hash of the IPv4 socket. Use the same FNv1a algorithm as
+ * for IPv6, which distributes the bits better than the old ad-hoc
+ * XOR of the fields, so buckets fill more evenly at high rates.
+ ***************************************************************************/
+static inline unsigned
+dedup_hash_ipv4(unsigned ip_them, unsigned port_them, unsigned ip_me, unsigned port_me)
+{
+    unsigned hash = fnv1a_seed;
+    hash = fnv1a_string(&ip_them, sizeof(ip_them), hash);
+    hash = fnv1a_string(&port_them, sizeof(port_them), hash);
+    hash = fnv1a_string(&ip_me, sizeof(ip_me), hash);
+    hash = fnv1a_string(&port_me, sizeof(port_me), hash);
+    return hash;
 }
 
 /***************************************************************************
@@ -240,8 +281,8 @@ dedup_is_duplicate_ipv4(struct DedupTable *dedup,
 
     /* THREAT: probably need to secure this hash, though the syn-cookies
      * provides some protection */
-    hash = (ip_them.ipv4 + port_them) ^ ((ip_me.ipv4) + (ip_them.ipv4>>16)) ^ (ip_them.ipv4>>24) ^ port_me;
-    hash &= DEDUP_ENTRIES-1;
+    hash = dedup_hash_ipv4(ip_them.ipv4, port_them, ip_me.ipv4, port_me);
+    hash &= dedup->mask;
 
     /* Search in this bucket */
     bucket = dedup->entries[hash];
@@ -338,7 +379,7 @@ dedup_selftest(void)
     unsigned found_match = 0;
     unsigned line = 0;
     
-    dedup = dedup_create();
+    dedup = dedup_create(0);
     
     /* Deterministic test.
      *

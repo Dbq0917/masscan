@@ -28,13 +28,14 @@ static int
 parse_port_unreachable(const unsigned char *px, unsigned length,
         unsigned *r_ip_me, unsigned *r_ip_them,
         unsigned *r_port_me, unsigned *r_port_them,
-        unsigned *r_ip_proto)
+        unsigned *r_ip_proto, unsigned *r_seqno)
 {
     if (length < 24)
         return -1;
     *r_ip_me = px[12]<<24 | px[13]<<16 | px[14]<<8 | px[15];
     *r_ip_them = px[16]<<24 | px[17]<<16 | px[18]<<8 | px[19];
     *r_ip_proto = px[9]; /* TCP=6, UDP=17 */
+    *r_seqno = 0;
 
     length -= (px[0]&0xF)<<2;
     px += (px[0]&0xF)<<2;
@@ -44,6 +45,17 @@ parse_port_unreachable(const unsigned char *px, unsigned length,
 
     *r_port_me = px[0]<<8 | px[1];
     *r_port_them = px[2]<<8 | px[3];
+
+    /*
+     * For TCP, the quoted header also contains the sequence number of
+     * our original SYN, which is our syn-cookie. The caller uses this
+     * to verify that the ICMP error really quotes one of our probes.
+     */
+    if (*r_ip_proto == 6) {
+        if (length < 8)
+            return -1;
+        *r_seqno = px[4]<<24 | px[5]<<16 | px[6]<<8 | px[7];
+    }
 
     return 0;
 }
@@ -57,6 +69,7 @@ int
 icmp_selftest(void)
 {
     unsigned ip_me, ip_them, port_me, port_them, ip_proto;
+    unsigned seqno;
     int err;
 
     /* bug 1: length inflated by 16 (+ instead of - 8 in handle_icmp).
@@ -68,7 +81,7 @@ icmp_selftest(void)
     };
     err = parse_port_unreachable(short_blob, sizeof(short_blob),
                                  &ip_me, &ip_them, &port_me, &port_them,
-                                 &ip_proto);
+                                 &ip_proto, &seqno);
     if (err != -1) return 1;
 
     /* bug 2: px advanced before length decremented, using the wrong px[0].
@@ -83,10 +96,43 @@ icmp_selftest(void)
     };
     err = parse_port_unreachable(blob, sizeof(blob),
                                  &ip_me, &ip_them, &port_me, &port_them,
-                                 &ip_proto);
+                                 &ip_proto, &seqno);
     if (err != 0)          return 1;
     if (port_me   != 1600) return 1;
     if (port_them != 53)   return 1;
+
+    /* A quoted TCP header must include the 4-byte sequence number,
+     * otherwise there's nothing to validate the cookie against. */
+    {
+        static const unsigned char tcp_short[] = {
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x00, 0x00,
+            0x40, 0x06, 0x00, 0x00,
+            0x0a, 0x00, 0x00, 0x01, /* src = 10.0.0.1  */
+            0xc0, 0x00, 0x02, 0x01, /* dst = 192.0.2.1 */
+            0x06, 0x40,             /* src port = 1600  */
+            0x00, 0x35,             /* dst port = 53    */
+        };
+        static const unsigned char tcp_full[] = {
+            0x45, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00,
+            0x40, 0x06, 0x00, 0x00,
+            0x0a, 0x00, 0x00, 0x01, /* src = 10.0.0.1  */
+            0xc0, 0x00, 0x02, 0x01, /* dst = 192.0.2.1 */
+            0x06, 0x40,             /* src port = 1600  */
+            0x00, 0x35,             /* dst port = 53    */
+            0xde, 0xad, 0xbe, 0xef, /* seqno = cookie  */
+        };
+        err = parse_port_unreachable(tcp_short, sizeof(tcp_short),
+                                     &ip_me, &ip_them, &port_me, &port_them,
+                                     &ip_proto, &seqno);
+        if (err != -1) return 1;
+
+        err = parse_port_unreachable(tcp_full, sizeof(tcp_full),
+                                     &ip_me, &ip_them, &port_me, &port_them,
+                                     &ip_proto, &seqno);
+        if (err != 0)              return 1;
+        if (ip_proto != 6)         return 1;
+        if (seqno != 0xdeadbeef)   return 1;
+    }
     return 0;
 }
 
@@ -94,7 +140,8 @@ void
 handle_icmp(struct Output *out, time_t timestamp,
             const unsigned char *px, unsigned length,
             struct PreprocessedInfo *parsed,
-            uint64_t entropy)
+            uint64_t entropy,
+            struct DedupTable *dedup)
 {
     unsigned type = parsed->port_src;
     unsigned code = parsed->port_dst;
@@ -102,13 +149,6 @@ handle_icmp(struct Output *out, time_t timestamp,
     ipaddress ip_me = parsed->dst_ip;
     ipaddress ip_them = parsed->src_ip;
     unsigned cookie;
-
-    /* dedup ICMP echo replies as well as SYN/ACK replies */
-    static struct DedupTable *echo_reply_dedup = NULL;
-
-
-    if (!echo_reply_dedup)
-        echo_reply_dedup = dedup_create();
 
     seqno_me = px[parsed->transport_offset+4]<<24
                 | px[parsed->transport_offset+5]<<16
@@ -122,7 +162,8 @@ handle_icmp(struct Output *out, time_t timestamp,
         if ((cookie & 0xFFFFFFFF) != seqno_me)
             return; /* not my response */
 
-        if (dedup_is_duplicate(echo_reply_dedup, ip_them, 0, ip_me, 0))
+        /* dedup ICMP echo replies as well as SYN/ACK replies */
+        if (dedup_is_duplicate(dedup, ip_them, 0, ip_me, 0))
             break;
 
         //if (syn_hash(ip_them, Templ_ICMP_echo) != seqno_me)
@@ -160,6 +201,8 @@ handle_icmp(struct Output *out, time_t timestamp,
                 ipaddress ip_them2;
                 unsigned port_me2, port_them2;
                 unsigned ip_proto;
+                unsigned seqno_me2;
+                unsigned dedup_port;
                 int err;
 
                 ip_me2.version = 4;
@@ -169,7 +212,7 @@ handle_icmp(struct Output *out, time_t timestamp,
                     px + parsed->transport_offset + 8,
                     length - parsed->transport_offset - 8,
                     &ip_me2.ipv4, &ip_them2.ipv4, &port_me2, &port_them2,
-                    &ip_proto);
+                    &ip_proto, &seqno_me2);
 
                 if (err)
                     return;
@@ -177,31 +220,38 @@ handle_icmp(struct Output *out, time_t timestamp,
                 if (!matches_me(out, ip_me2, port_me2))
                     return;
 
+                /*
+                 * For TCP, verify that the quoted sequence number is a
+                 * valid syn-cookie for the quoted addresses. Otherwise
+                 * the ICMP error doesn't pair with any probe we sent:
+                 * it's backscatter or noise from a router/middlebox,
+                 * and reporting it would attribute a bogus result to
+                 * the quoted address.
+                 */
+                if (ip_proto == 6) {
+                    uint64_t ck;
+
+                    ck = syn_cookie(ip_them2, port_them2,
+                                    ip_me2, port_me2, entropy);
+                    if ((unsigned)(ck & 0xFFFFFFFF) != seqno_me2)
+                        return; /* not a response to our probe */
+                }
+
+                /*
+                 * Ignore duplicates. The protocol is folded into the
+                 * port number so that results for different protocols
+                 * don't suppress each other; TCP shares the key used
+                 * by the SYN-ACK path in the receive thread.
+                 */
+                dedup_port = port_them2;
+                if (ip_proto != 6)
+                    dedup_port |= (ip_proto << 16);
+                if (dedup_is_duplicate(dedup, ip_them2, dedup_port, ip_me2, port_me2))
+                    return;
+
                 switch (ip_proto) {
                 case 6:
-                    output_report_status(
-                                        out,
-                                        timestamp,
-                                        PortStatus_Closed,
-                                        ip_them2,
-                                        ip_proto,
-                                        port_them2,
-                                        0,
-                                        parsed->ip_ttl,
-                                        parsed->mac_src);
-                    break;
                 case 17:
-                    output_report_status(
-                                        out,
-                                        timestamp,
-                                        PortStatus_Closed,
-                                        ip_them2,
-                                        ip_proto,
-                                        port_them2,
-                                        0,
-                                        parsed->ip_ttl,
-                                        parsed->mac_src);
-                    break;
                 case 132:
                     output_report_status(
                                         out,

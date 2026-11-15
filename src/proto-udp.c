@@ -9,6 +9,7 @@
 #include "proto-zeroaccess.h"
 #include "proto-preprocess.h"
 #include "syn-cookie.h"
+#include "main-dedup.h"
 #include "util-logger.h"
 #include "output.h"
 #include "masscan-status.h"
@@ -54,11 +55,24 @@ default_udp_parse(struct Output *out, time_t timestamp,
 void 
 handle_udp(struct Output *out, time_t timestamp,
         const unsigned char *px, unsigned length, 
-        struct PreprocessedInfo *parsed, uint64_t entropy)
+        struct PreprocessedInfo *parsed, uint64_t entropy,
+        struct DedupTable *dedup)
 {
     ipaddress ip_them = parsed->src_ip;
+    ipaddress ip_me = parsed->dst_ip;
     unsigned port_them = parsed->port_src;
+    unsigned port_me = parsed->port_dst;
     unsigned status = 0;
+
+    /*
+     * Ignore duplicates. We get multiple responses to the same probe,
+     * either because the network duplicated packets or because the
+     * target retransmitted. The protocol is folded into the port
+     * number so that a UDP response doesn't suppress a TCP result
+     * for the same port (and vice versa).
+     */
+    if (dedup_is_duplicate(dedup, ip_them, port_them | (17<<16), ip_me, port_me))
+        return;
 
     /* Report "open" status regardless  */
     output_report_status(

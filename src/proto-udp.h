@@ -4,6 +4,7 @@
 #include <stdint.h>
 struct PreprocessedInfo;
 struct Output;
+struct DedupTable;
 
 /**
  * Parse an incoming UDP response. We parse the basics, then hand it off
@@ -15,7 +16,8 @@ void
 handle_udp(struct Output *out, time_t timestamp,
     const unsigned char *px, unsigned length,
     struct PreprocessedInfo *parsed,
-    uint64_t entropy);
+    uint64_t entropy,
+    struct DedupTable *dedup);
 
 /**
  * Default banner for UDP, consisting of the first 64 bytes, when it isn't

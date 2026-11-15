@@ -595,8 +595,35 @@ receive_thread(void *v)
     /*
      * Create deduplication table. This is so when somebody sends us
      * multiple responses, we only record the first one.
+     *
+     * The table evicts old entries as new ones collide into their
+     * buckets, so its size effectively limits how long a response is
+     * remembered. Targets retransmit SYN-ACKs for several seconds
+     * (we never ACK them), so at high transmit rates the historic
+     * fixed-size table would be flushed within seconds and
+     * retransmissions would be reported as duplicates. Scale the
+     * table with the transmit rate so that it always holds several
+     * seconds worth of responses, instead of slowing the scan down.
      */
-    dedup = dedup_create();
+    {
+        uint64_t rate = (uint64_t)(masscan->max_rate / masscan->nic_count);
+        uint64_t buckets = rate * DEDUP_WINDOW_SECONDS / 4;
+        unsigned rounded;
+
+        if (buckets < DEDUP_MIN_ENTRIES)
+            buckets = DEDUP_MIN_ENTRIES;
+        if (buckets > DEDUP_MAX_ENTRIES)
+            buckets = DEDUP_MAX_ENTRIES;
+        /* round up to a power-of-two, so the log message below
+         * matches the table size that dedup_create() will use */
+        for (rounded = DEDUP_MIN_ENTRIES; rounded < buckets; rounded <<= 1)
+            ;
+        buckets = rounded;
+        dedup = dedup_create((unsigned)buckets);
+        LOG(1, "[+] dedup table: %llu buckets (%llu MB)\n",
+            (unsigned long long)buckets,
+            (unsigned long long)(buckets * 4 * 16) >> 20);
+    }
 
     /*
      * Create a TCP connection table (per thread pair) for interacting with live
@@ -912,10 +939,10 @@ receive_thread(void *v)
                     continue;
                 if (parms->masscan->nmap.packet_trace)
                     packet_trace(stdout, parms->pt_start, px, length, 0);
-                handle_udp(out, secs, px, length, &parsed, entropy);
+                handle_udp(out, secs, px, length, &parsed, entropy, dedup);
                 continue;
             case FOUND_ICMP:
-                handle_icmp(out, secs, px, length, &parsed, entropy);
+                handle_icmp(out, secs, px, length, &parsed, entropy, dedup);
                 continue;
             case FOUND_SCTP:
                 handle_sctp(out, secs, px, length, cookie, &parsed, entropy);
